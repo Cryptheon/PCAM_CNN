@@ -37,26 +37,21 @@ class MLP(nn.Module):
         for layer in self.mlp:
             x = layer(x)
         
+        # get only the 48 sized latents
         x = self.map(self.flatten(x))
-        x = self.out(self.relu(x))
         return x
-    
-def get_dataset(args):
-    transform = transforms.Compose([transforms.RandomHorizontalFlip(p=0.5),
-                                    transforms.RandomVerticalFlip(p=0.5),
-                                    transforms.ToTensor(), 
-                                    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))])
 
+def get_dataset(args):
+    
     val_transform = transforms.Compose([transforms.ToTensor(), 
                                     transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))])
 
-
-    train_dataset = datasets.PCAM(root="./", split='train', transform=transform, download=True)
+    train_dataset = datasets.PCAM(root="./", split='train', transform=val_transform, download=True)
     val_dataset = datasets.PCAM(root="./", split='val', transform=val_transform, download=True)
 
     train_dataloader = DataLoader(train_dataset, 
                             batch_size=args.batch_size, 
-                            shuffle=True, 
+                            shuffle=False, 
                             num_workers=args.num_workers)
     
     val_dataloader = DataLoader(val_dataset, 
@@ -68,63 +63,55 @@ def get_dataset(args):
     return train_dataloader, val_dataloader
 
 @torch.no_grad()
-def validate(args, model, criterion, dataloader):
+def validate(args, model, dataloader):
     model.eval()
-    F1 = torchmetrics.F1Score(task="binary")
-    losses = []
-    predictions = []
+    latents = []
     Y = []
     for i, (x, y) in enumerate(dataloader):
-        x , y = x.to(device), y.to(device).float()
+        x = x.to(device)
         Y += y.cpu().tolist()
-        output = model(x).squeeze(1)
-        prediction = torch.sigmoid(output) > 0.5
-        predictions += prediction.cpu().tolist()
-        loss = criterion(output, y)
-        losses.append(loss.item())
+        output = model(x).squeeze(1).cpu().numpy()
+        latents.append(output)
+    return latents, Y
 
-    f1 = F1(torch.tensor(predictions), torch.tensor(Y))
-    wandb.log({'log-step': i, 'val-loss': np.array(losses).mean(), "f1-score": np.array(f1).mean()})
-
-def train(args, model, train_dataloader, optimizer, criterion):
-    model.train()
-    losses = []
-    metric = Throughput()
-    ts = time.monotonic()
+@torch.no_grad()
+def train(args, model, train_dataloader):
+    latents = []
+    Y = []
     for i, (x, y) in enumerate(train_dataloader):
-        x , y = x.to(device), y.to(device).float()
+        x = x.to(device)
 
-        output = model(x).squeeze(1)
+        Y += y.cpu().tolist()
+        output = model(x).squeeze(1).cpu().numpy()
+        latents.append(output)
 
-        loss = criterion(output, y)
-        loss.backward()
-        losses.append(loss.item())
-        optimizer.step()
-        optimizer.zero_grad()
-
-        if i%100==0:
-            elapsed_time_sec = time.monotonic() - ts
-            metric.update((i+1)*args.batch_size, elapsed_time_sec)
-            throughput = metric.compute()
-            wandb.log({'log-step': i, 'train-loss': np.array(losses[-100:]).mean(), "throughput imgs/sec":throughput})
-
+    return latents, Y
 
 def main(args):
     model = MLP(args.n_hidden, args.n_layers)
-    model = torch.compile(model)
     model = model.to(device)
+    state_dict = torch.load("./models/48_latent_model_0.85.pt")
+    
+    state_dict = {k.replace("_orig_mod.", ""): v for k,v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model.eval()
 
     train_dataloader, val_dataloader = get_dataset(args)
 
-    optimizer = Adam(model.parameters(), lr=args.learning_rate)
-    criterion = nn.BCEWithLogitsLoss()
-    wandb.init(project="PCAM-small-CNN")
+    train_latents, y_train = train(args, model, train_dataloader)
+    val_latents, y_val = validate(args, model, val_dataloader)
 
-    for i in range(10):
-        train(args, model, train_dataloader, optimizer, criterion)
-        validate(args, model, criterion, val_dataloader)
-    
-    torch.save(model.state_dict(), "./models/48_latent_model.pt")
+    train_latents = np.vstack(train_latents)
+    val_latents = np.vstack(val_latents)
+
+    y_train = np.array(y_train)
+    y_val = np.array(y_val)
+
+    np.save('./latents/train_latents_48.npy', train_latents)
+    np.save('./latents/val_latents_48.npy', val_latents)
+    np.save('./latents/train_y.npy', y_train)
+    np.save('./latents/val_y.npy', y_val)
+
 
 if __name__=="__main__":
     
@@ -134,9 +121,9 @@ if __name__=="__main__":
     # Add arguments
     parser.add_argument('--data_path', type=str, help='Input file path')
     parser.add_argument('--n_layers', type=int, default=4, help='Enable verbose mode')
-    parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--n_hidden", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=256)
+
 
     parser.add_argument("--num_workers", type=int, default=16)
 
